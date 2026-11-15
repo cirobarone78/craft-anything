@@ -201,6 +201,14 @@ fn note_with_just_asked(text: String, ws: &Workspace, clean_room: bool, skip: &[
     (format!("{}{text}", just_asked(&asked)), asked)
 }
 
+/// A note is a new request, so Ghidra may be used again if the person stopped it (#948). A failed
+/// removal leaves it off, which the built-in engine covers, so it's only logged.
+fn resume_ghidra(ws: &Workspace) {
+    if let Err(e) = craft_anything_engine::tools::deep::resume(&ws.root) {
+        log::warn!("couldn't let Ghidra be used again for this project: {e}");
+    }
+}
+
 fn same_question(a: &AskedQuestion, b: &AskedQuestion) -> bool {
     a.at_ms == b.at_ms && a.question == b.question
 }
@@ -710,6 +718,7 @@ impl Worker {
         if notes.is_empty() {
             return None;
         }
+        resume_ghidra(ws);
         for n in &notes {
             self.emit(RunEvent::Note { shown: n.shown.clone(), pictures: n.pictures.clone() });
         }
@@ -1438,6 +1447,9 @@ impl Worker {
             }
             notes::forget(&dir, n.id);
             self.emit(RunEvent::Note { shown: n.shown, pictures: n.pictures });
+        }
+        if new_request {
+            resume_ghidra(ws);
         }
         self.reset_progress_after_notes |= new_request;
     }

@@ -55,18 +55,18 @@ fn provider_for_active(ctx: &mut Ctx<'_>) -> Result<Arc<dyn DeepDecompiler>, Opt
     if ctx.session.clean_room() {
         return Err(None);
     }
+    // Stopped for this workspace's builds (its investigation is `<workspace>/investigation.cany`):
+    // a decompile mustn't start the analysis again (#1118 review), nor use a Ghidra opened before
+    // the stop. Not remembered: a new request lets the next call use Ghidra.
+    let workspace = ctx.session.project.as_ref().and_then(|p| p.root.parent()).map(Path::to_path_buf);
+    if workspace.as_deref().is_some_and(stopped) {
+        return Err(Some(STOPPED_NOTE.into()));
+    }
     // Already decided for this target?
     if let Ok(t) = ctx.session.active()
         && let Some(slot) = t.ext.get::<DeepSlot>()
     {
         return slot.provider.clone().map_err(Some);
-    }
-    // Stopped for this workspace's builds (its investigation is `<workspace>/investigation.cany`):
-    // a decompile mustn't start the analysis again (#1118 review). Not remembered: a new request
-    // lets the next call use Ghidra.
-    let workspace = ctx.session.project.as_ref().and_then(|p| p.root.parent()).map(Path::to_path_buf);
-    if workspace.as_deref().is_some_and(stopped) {
-        return Err(Some(STOPPED_NOTE.into()));
     }
 
     // The target's bytes and identity.
@@ -138,7 +138,8 @@ pub fn prepare(settings: &Settings, bytes: &[u8], sha256: &str, project: &Path, 
 }
 
 /// A file in a project's folder: Ghidra's analysis was stopped for its builds, and stays off for
-/// them (the builder's tool server too) until a new request ([`resume`]).
+/// them (the builder's tool server too) until a new request ([`resume`]), a note added to a
+/// running build included.
 pub const STOPPED: &str = "ghidra-stopped";
 
 /// Whether Ghidra was stopped for `project`'s builds.
