@@ -12,11 +12,14 @@
 
 use crate::settings::Settings;
 use crate::tool::{Ctx, ToolOutput};
+use crate::workspace::MANIFEST;
 use craft_anything_engines::ghidra::{self, DeepDecompiler, DeepFunction};
 use craft_anything_evidence::{Confidence, Environment, EvidenceBuilder, Limitation, Location, ToolError, host_triple};
+use craft_anything_platform::sync::Mutex;
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 /// The analysis settings hash for the default Deep profile. Part of the project cache key, so a
@@ -42,6 +45,8 @@ const ANALYSIS_LIMIT_SECS: u64 = 8 * 3600;
 /// instead (the built-in decompiler's answer, or that no function was found).
 /// Deep mode is on but Ghidra isn't installed.
 pub const NOT_INSTALLED: &str = "Deep mode is on, but Ghidra isn't installed. The person can get Ghidra from Settings → Engines.";
+/// The person stopped Ghidra's analysis for this project.
+pub const STOPPED_NOTE: &str = "The person stopped Ghidra's analysis for this project; a new request starts it again.";
 
 /// Get (or lazily create) the deep provider for the active target. `Err(Some(why))`: Deep mode is
 /// on but Ghidra can't be used; `Err(None)`: Clean room (never launches). Either way the caller
@@ -55,6 +60,13 @@ fn provider_for_active(ctx: &mut Ctx<'_>) -> Result<Arc<dyn DeepDecompiler>, Opt
         && let Some(slot) = t.ext.get::<DeepSlot>()
     {
         return slot.provider.clone().map_err(Some);
+    }
+    // Stopped for this workspace's builds (its investigation is `<workspace>/investigation.cany`):
+    // a decompile mustn't start the analysis again (#1118 review). Not remembered: a new request
+    // lets the next call use Ghidra.
+    let workspace = ctx.session.project.as_ref().and_then(|p| p.root.parent()).map(Path::to_path_buf);
+    if workspace.as_deref().is_some_and(stopped) {
+        return Err(Some(STOPPED_NOTE.into()));
     }
 
     // The target's bytes and identity.
@@ -73,7 +85,7 @@ fn provider_for_active(ctx: &mut Ctx<'_>) -> Result<Arc<dyn DeepDecompiler>, Opt
         return Err(Some(NOT_INSTALLED.into()));
     };
     let cancel = ctx.cancel.clone();
-    let cancel_fn = move || cancel.is_cancelled();
+    let cancel_fn = move || cancel.is_cancelled() || workspace.as_deref().is_some_and(stopped);
     let progress = ctx.progress;
     let report = |f: f32, m: &str| (progress)(crate::tool::Progress { fraction: Some(f), message: m.to_string() });
 
@@ -108,19 +120,85 @@ fn config(settings: &Settings, language_override: Option<String>) -> Option<(ghi
 
 /// Analyse a program with Ghidra ahead of time (Deep mode), so the builder's first decompile opens
 /// a saved analysis instead of waiting hours for one. Shares the analysis with any other process
-/// doing the same. `progress` gets a line now and then; `stop` ends it early (its project is gone).
-pub fn prepare(settings: &Settings, bytes: &[u8], sha256: &str, progress: &(dyn Fn(&str) + Send + Sync), stop: &ghidra::Cancel<'_>) -> Result<(), String> {
+/// doing the same. `progress` gets a line now and then. It stops early once `project`, the
+/// workspace whose build asked, is deleted or stops it ([`stop_for`]) (#948).
+pub fn prepare(settings: &Settings, bytes: &[u8], sha256: &str, project: &Path, progress: &(dyn Fn(&str) + Send + Sync)) -> Result<(), String> {
     let (cfg, digest) = config(settings, None).ok_or_else(|| NOT_INSTALLED.to_string())?;
-    ANALYSING.fetch_add(1, Ordering::SeqCst);
-    let closing = || CLOSING.load(Ordering::SeqCst) || stop();
+    let asked = Asked::new(project);
+    let record = project.join(MANIFEST);
+    let closing = || {
+        CLOSING.load(Ordering::SeqCst)
+            // Only a record known to be gone: a drive that can't be read for a moment isn't a delete.
+            || matches!(record.try_exists(), Ok(false))
+            || stopped(project)
+    };
     let result = ghidra::analyse(&cfg, bytes, sha256, &digest, &closing, &|_, m: &str| progress(m)).map(|_| ()).map_err(|e| e.to_string());
-    ANALYSING.fetch_sub(1, Ordering::SeqCst);
+    drop(asked);
     result
+}
+
+/// A file in a project's folder: Ghidra's analysis was stopped for its builds, and stays off for
+/// them (the builder's tool server too) until a new request ([`resume`]).
+pub const STOPPED: &str = "ghidra-stopped";
+
+/// Whether Ghidra was stopped for `project`'s builds.
+pub fn stopped(project: &Path) -> bool {
+    project.join(STOPPED).is_file()
+}
+
+/// Stop Ghidra for `project`'s builds: the analyses its builds asked [`prepare`] for end at their
+/// next check (within 2 s), and its decompiles use the built-in engine until a new request.
+/// Whether this process had one under way.
+pub fn stop_for(project: &Path) -> Result<bool, ToolError> {
+    if !project.join(MANIFEST).is_file() {
+        return Err(ToolError::invalid(format!("{} isn't a project folder (it has no {MANIFEST}).", project.display())));
+    }
+    craft_anything_platform::fs::write_atomic(&project.join(STOPPED), b"")?;
+    let mut asked = PREPARING.lock().unwrap_or_else(PoisonError::into_inner);
+    let before = asked.len();
+    asked.retain(|(_, p)| p != project);
+    Ok(asked.len() != before)
+}
+
+/// A new request for `project`: Ghidra may be used for its builds again.
+pub fn resume(project: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(project.join(STOPPED)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// Whether Ghidra is analysing a program for `project`'s build in this process, and wasn't
+/// stopped. Reads memory only, so a screen can ask while drawing.
+pub fn analysing_for(project: &Path) -> bool {
+    PREPARING.lock().unwrap_or_else(PoisonError::into_inner).iter().any(|(_, p)| p == project)
+}
+
+/// One [`prepare`] under way, counted while it lives.
+struct Asked(u64);
+
+impl Asked {
+    fn new(project: &Path) -> Self {
+        let id = NEXT_ASKED.fetch_add(1, Ordering::SeqCst);
+        PREPARING.lock().unwrap_or_else(PoisonError::into_inner).push((id, project.to_path_buf()));
+        ANALYSING.fetch_add(1, Ordering::SeqCst);
+        Asked(id)
+    }
+}
+
+impl Drop for Asked {
+    fn drop(&mut self) {
+        PREPARING.lock().unwrap_or_else(PoisonError::into_inner).retain(|(id, _)| *id != self.0);
+        ANALYSING.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Analyses [`prepare`] has under way, and whether they are being stopped.
 static ANALYSING: AtomicUsize = AtomicUsize::new(0);
 static CLOSING: AtomicBool = AtomicBool::new(false);
+/// Each [`prepare`] under way and the project that asked, until [`stop_for`] takes it out.
+static PREPARING: Mutex<Vec<(u64, PathBuf)>> = Mutex::new(Vec::new());
+static NEXT_ASKED: AtomicU64 = AtomicU64::new(0);
 
 /// The app is closing: stop every analysis [`prepare`] started and wait up to `within` for them to
 /// end, as nothing acts on a process's drop once the app has gone (#946).

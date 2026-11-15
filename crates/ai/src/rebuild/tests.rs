@@ -4654,6 +4654,19 @@ fn deleting_the_project_stops_its_analysis() {
     assert!(ended.is_err(), "it stopped, it didn't finish: {ended:?}");
 }
 
+/// The person stopped Ghidra for the project: a study doesn't start it again until a new request.
+#[test]
+fn a_study_leaves_ghidra_off_once_the_person_stopped_it() {
+    let d = tempfile::Builder::new().prefix("ca").tempdir().unwrap();
+    let (w, _rx, ws, program) = waiting_for_another_analysis(d.path(), 600);
+    craft_anything_engine::tools::deep::stop_for(&ws.root).unwrap();
+    assert!(w.prepare_ghidra(&program, &ws.root).is_none(), "stopped, so not started");
+    craft_anything_engine::tools::deep::resume(&ws.root).unwrap();
+    let done = w.prepare_ghidra(&program, &ws.root).expect("a new request lets it run");
+    ws.delete().unwrap();
+    assert!(done.recv_timeout(Duration::from_secs(20)).is_ok_and(|r| r.is_err()), "ends with the project");
+}
+
 /// A later run skips the study; in Deep mode it opens the program again, so the builder's tool
 /// server has it and its first `native_*` call doesn't say "Nothing is open yet" (#1421).
 #[test]

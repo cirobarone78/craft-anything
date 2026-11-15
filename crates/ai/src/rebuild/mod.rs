@@ -815,6 +815,9 @@ impl Worker {
         if opts.message.as_deref().is_some_and(|m| !m.trim().is_empty()) {
             progress.reset();
             progress.save(&ws.root)?;
+            // Ghidra, if the person stopped it for this project, may be used again (#948).
+            craft_anything_engine::tools::deep::resume(&ws.root)
+                .map_err(|e| ToolError::new(ErrorCode::FileError, format!("Couldn't let Ghidra be used again for this project: {e}")))?;
         }
         // Fail before any work when the agent's tools are missing or it can't sign in.
         let remote_host = entry.config.ssh_host.as_deref().map(str::trim).filter(|h| !h.is_empty());
