@@ -155,6 +155,7 @@ pub fn stop_for(project: &Path) -> Result<bool, ToolError> {
         return Err(ToolError::invalid(format!("{} isn't a project folder (it has no {MANIFEST}).", project.display())));
     }
     // When it was stopped, so a request made before it doesn't start Ghidra again ([`resume_for`]).
+    let _lock = marker_lock(project).map_err(|e| ToolError::io(project.display(), e))?;
     let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
     craft_anything_platform::fs::write_atomic(&project.join(STOPPED), at.to_string().as_bytes())?;
     let mut asked = PREPARING.lock().unwrap_or_else(PoisonError::into_inner);
@@ -175,24 +176,46 @@ pub fn resume(project: &Path) -> std::io::Result<()> {
 /// stopped it after making it (a note left waiting while they pressed Stop). A stop with no time
 /// (an older version's) is cleared.
 pub fn resume_for(project: &Path, asked: std::time::SystemTime) -> std::io::Result<()> {
-    static CLAIMS: AtomicU64 = AtomicU64::new(0);
     let at = asked.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
     let marker = project.join(STOPPED);
-    // The stop is moved aside before it's read, so a stop made meanwhile (by this or another
-    // process) writes a new marker that this call never removes.
-    let claimed = project.join(format!("{STOPPED}.{}.{}", std::process::id(), CLAIMS.fetch_add(1, Ordering::SeqCst)));
-    match std::fs::rename(&marker, &claimed) {
+    // No stop: nothing to judge. One written after this look is later than the request anyway.
+    if !marker.is_file() {
+        return Ok(());
+    }
+    // Judged in place under the lock: the stop stays visible to `stopped` the whole time, and a stop
+    // or another resume (from any process) waits for this one instead of interleaving with it.
+    let _lock = marker_lock(project)?;
+    let stopped_at = match std::fs::read_to_string(&marker) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
-        Ok(()) => {}
-    }
-    let stopped_at = std::fs::read_to_string(&claimed).ok().and_then(|s| s.trim().parse::<u128>().ok());
+        r => r?.trim().parse::<u128>().ok(),
+    };
     if stopped_at.is_some_and(|s| s > at) {
-        // shortcut: putting it back replaces a stop made in the last moment with this earlier,
-        // still-later-than-the-request one; both keep Ghidra off. Use a lock file if that matters.
-        return std::fs::rename(&claimed, &marker);
+        return Ok(());
     }
-    std::fs::remove_file(&claimed)
+    match std::fs::remove_file(&marker) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// Held while the stop marker is written or judged ([`stop_for`], [`resume_for`]). Holders touch
+/// one small file, and the system frees a lock whose process ended, so a short wait is enough.
+fn marker_lock(project: &Path) -> std::io::Result<std::fs::File> {
+    let path = project.join("ghidra-stop.lock");
+    let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)?;
+    let started = std::time::Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if started.elapsed() < std::time::Duration::from_secs(5) => {
+                std::thread::sleep(std::time::Duration::from_millis(5))
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, format!("{} is held by another program", path.display())));
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        }
+    }
 }
 
 /// Whether Ghidra is analysing a program for `project`'s build in this process, and wasn't
