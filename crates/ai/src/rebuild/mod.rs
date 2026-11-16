@@ -188,6 +188,8 @@ pub struct Note {
     /// they're marked told when the builder reads the note or when the after-turn path sends it.
     /// The raw note text stays in [`text`](Self::text), so a later run filters them by its mode.
     pub questions: Vec<AskedQuestion>,
+    /// When the person added it: a note from before they stopped Ghidra doesn't start it again.
+    pub added: std::time::SystemTime,
 }
 
 /// The note text with the latest Just-ask answers this mode may show. `skip` holds answers an
@@ -201,10 +203,12 @@ fn note_with_just_asked(text: String, ws: &Workspace, clean_room: bool, skip: &[
     (format!("{}{text}", just_asked(&asked)), asked)
 }
 
-/// A note is a new request, so Ghidra may be used again if the person stopped it (#948). A failed
-/// removal leaves it off, which the built-in engine covers, so it's only logged.
-fn resume_ghidra(ws: &Workspace) {
-    if let Err(e) = craft_anything_engine::tools::deep::resume(&ws.root) {
+/// A note is a new request, so Ghidra may be used again if the person stopped it before adding
+/// the newest of `notes` (#948). A failed removal leaves it off, which the built-in engine
+/// covers, so it's only logged.
+fn resume_ghidra<'a>(ws: &Workspace, notes: impl IntoIterator<Item = &'a Note>) {
+    let Some(asked) = notes.into_iter().filter(|n| !n.text.trim().is_empty()).map(|n| n.added).max() else { return };
+    if let Err(e) = craft_anything_engine::tools::deep::resume_for(&ws.root, asked) {
         log::warn!("couldn't let Ghidra be used again for this project: {e}");
     }
 }
@@ -419,7 +423,7 @@ impl RebuildRun {
         if let Err(e) = notes::hand_over(&notes::notes_dir(self.inbox.dir()), id, &file_text, Some(&left)) {
             log::warn!("A note waits for the builder's turn to end: {}", e.message);
         }
-        self.notes.lock().unwrap_or_else(PoisonError::into_inner).push(Note { id, text, shown, pictures, questions });
+        self.notes.lock().unwrap_or_else(PoisonError::into_inner).push(Note { id, text, shown, pictures, questions, added: std::time::SystemTime::now() });
         id
     }
 
@@ -718,7 +722,7 @@ impl Worker {
         if notes.is_empty() {
             return None;
         }
-        resume_ghidra(ws);
+        resume_ghidra(ws, &notes);
         for n in &notes {
             self.emit(RunEvent::Note { shown: n.shown.clone(), pictures: n.pictures.clone() });
         }
@@ -1438,6 +1442,7 @@ impl Worker {
             read
         };
         let new_request = read.iter().any(|n| !n.text.trim().is_empty());
+        resume_ghidra(ws, &read);
         for n in read {
             // The agent's hook took the note, so the Just-ask answers in its text were told.
             if !n.questions.is_empty()
@@ -1447,9 +1452,6 @@ impl Worker {
             }
             notes::forget(&dir, n.id);
             self.emit(RunEvent::Note { shown: n.shown, pictures: n.pictures });
-        }
-        if new_request {
-            resume_ghidra(ws);
         }
         self.reset_progress_after_notes |= new_request;
     }

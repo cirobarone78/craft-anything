@@ -554,11 +554,25 @@ fn notes_added_while_it_works_reach_the_agent_at_its_next_step() {
     use craft_anything_engine::questions::{self, AskedQuestion};
     let asked = AskedQuestion { deep: false, ..AskedQuestion::new("where is the score kept".into(), "In src.".into(), true, "Stand-in".into(), None, 0) };
     questions::add(&ws, asked.clone()).unwrap();
-    let note = |id, text: &str| Note { id, text: format!("{text} (pictures: a.png)"), shown: text.into(), pictures: Vec::new(), questions: Vec::new() };
+    let note = |id, text: &str| Note {
+        id,
+        text: format!("{text} (pictures: a.png)"),
+        shown: text.into(),
+        pictures: Vec::new(),
+        questions: Vec::new(),
+        added: std::time::SystemTime::now(),
+    };
+    // A note left waiting when the person pressed Stop was asked before it: Ghidra stays off.
+    notes.lock().unwrap().push(note(9, "Older"));
+    std::thread::sleep(Duration::from_millis(5));
+    craft_anything_engine::tools::deep::stop_for(&ws.root).unwrap();
+    w.added(&mut ws, true, true).unwrap();
+    assert!(craft_anything_engine::tools::deep::stopped(&ws.root), "a note from before the stop doesn't undo it");
+    let _ = rx.try_iter().count();
+    std::thread::sleep(Duration::from_millis(5));
     let mut first = note(1, "Make it faster");
     first.questions = vec![asked];
     notes.lock().unwrap().extend([first, note(2, "A blue sky")]);
-    craft_anything_engine::tools::deep::stop_for(&ws.root).unwrap();
     let (p, more) = w.added(&mut ws, true, true).unwrap();
     assert!(!craft_anything_engine::tools::deep::stopped(&ws.root), "a note is a new request, so Ghidra may run again");
     assert!(p.contains("where is the score kept") && p.contains("- Make it faster (pictures: a.png)\n- A blue sky"), "{p}");
@@ -2338,7 +2352,7 @@ mod picking_up_a_build {
         use crate::model::{Block, ChatModel, Delta, Stop, StopReason, TurnRequest, TurnResult};
         type Notes = Arc<Mutex<Vec<Note>>>;
         fn note(text: &str) -> Note {
-            Note { id: 42, text: text.into(), shown: text.into(), pictures: Vec::new(), questions: Vec::new() }
+            Note { id: 42, text: text.into(), shown: text.into(), pictures: Vec::new(), questions: Vec::new(), added: std::time::SystemTime::now() }
         }
         struct NoteModel {
             script: Scripted,
@@ -3957,8 +3971,22 @@ fn a_note_the_builder_took_at_a_step_joins_the_feed_and_isnt_sent_again() {
         inbox: Inbox::new(ws.inbox_dir()),
         editor: None,
         notes: Arc::new(Mutex::new(vec![
-            Note { id: 1, text: "make the header blue".into(), shown: "make the header blue".into(), pictures: Vec::new(), questions: vec![asked] },
-            Note { id: 2, text: "add a footer".into(), shown: "add a footer".into(), pictures: Vec::new(), questions: Vec::new() },
+            Note {
+                id: 1,
+                text: "make the header blue".into(),
+                shown: "make the header blue".into(),
+                pictures: Vec::new(),
+                questions: vec![asked],
+                added: std::time::SystemTime::now() + Duration::from_secs(1),
+            },
+            Note {
+                id: 2,
+                text: "add a footer".into(),
+                shown: "add a footer".into(),
+                pictures: Vec::new(),
+                questions: Vec::new(),
+                added: std::time::SystemTime::now() + Duration::from_secs(1),
+            },
         ])),
         feed: Arc::new(Mutex::new(feed::FeedLog::open(&ws))),
         keys: crate::KeyStore::file_only(ws.root.join("keys.toml")),

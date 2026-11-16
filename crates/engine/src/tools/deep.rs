@@ -154,7 +154,9 @@ pub fn stop_for(project: &Path) -> Result<bool, ToolError> {
     if !project.join(MANIFEST).is_file() {
         return Err(ToolError::invalid(format!("{} isn't a project folder (it has no {MANIFEST}).", project.display())));
     }
-    craft_anything_platform::fs::write_atomic(&project.join(STOPPED), b"")?;
+    // When it was stopped, so a request made before it doesn't start Ghidra again ([`resume_for`]).
+    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+    craft_anything_platform::fs::write_atomic(&project.join(STOPPED), at.to_string().as_bytes())?;
     let mut asked = PREPARING.lock().unwrap_or_else(PoisonError::into_inner);
     let before = asked.len();
     asked.retain(|(_, p)| p != project);
@@ -167,6 +169,18 @@ pub fn resume(project: &Path) -> std::io::Result<()> {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
         _ => Ok(()),
     }
+}
+
+/// A request the person made at `asked` for `project`: Ghidra may be used again, unless they
+/// stopped it after making it (a note left waiting while they pressed Stop). A stop with no time
+/// (an older version's) is cleared.
+pub fn resume_for(project: &Path, asked: std::time::SystemTime) -> std::io::Result<()> {
+    let at = asked.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let stopped_at = std::fs::read_to_string(project.join(STOPPED)).ok().and_then(|s| s.trim().parse::<u128>().ok());
+    if stopped_at.is_some_and(|s| s > at) {
+        return Ok(());
+    }
+    resume(project)
 }
 
 /// Whether Ghidra is analysing a program for `project`'s build in this process, and wasn't
