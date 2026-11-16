@@ -161,3 +161,26 @@ fn the_stop_stays_visible_while_requests_judge_it() {
     }
     assert!(!deep::stopped(&root), "the newer request's resume held");
 }
+
+/// #1903 review: a stop that took its time but hasn't written it yet doesn't outlast a request made
+/// after that time: the request waits for the stop's lock and then judges it.
+#[test]
+fn a_request_waits_for_a_stop_being_written() {
+    let d = tempfile::Builder::new().prefix("ca").tempdir().unwrap();
+    let root = project(d.path());
+    deep::resume_for(&root, std::time::SystemTime::now()).unwrap();
+    assert!(!root.join("ghidra-stop.lock").exists(), "a project never stopped gets no lock file");
+    // Stand in for a stop between taking its time and writing it.
+    let lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(root.join("ghidra-stop.lock")).unwrap();
+    lock.lock().unwrap();
+    let stopped_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    std::thread::sleep(Duration::from_millis(5));
+    let asked = std::time::SystemTime::now();
+    let r = root.clone();
+    let request = std::thread::spawn(move || deep::resume_for(&r, asked).unwrap());
+    std::thread::sleep(Duration::from_millis(100));
+    std::fs::write(root.join(deep::STOPPED), stopped_at.to_string()).unwrap();
+    lock.unlock().unwrap();
+    request.join().unwrap();
+    assert!(!deep::stopped(&root), "the request came after the stop's time");
+}

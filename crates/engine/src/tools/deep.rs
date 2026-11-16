@@ -155,7 +155,7 @@ pub fn stop_for(project: &Path) -> Result<bool, ToolError> {
         return Err(ToolError::invalid(format!("{} isn't a project folder (it has no {MANIFEST}).", project.display())));
     }
     // When it was stopped, so a request made before it doesn't start Ghidra again ([`resume_for`]).
-    let _lock = marker_lock(project).map_err(|e| ToolError::io(project.display(), e))?;
+    let _lock = marker_lock(project, true).map_err(|e| ToolError::io(project.display(), e))?;
     let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
     craft_anything_platform::fs::write_atomic(&project.join(STOPPED), at.to_string().as_bytes())?;
     let mut asked = PREPARING.lock().unwrap_or_else(PoisonError::into_inner);
@@ -178,13 +178,14 @@ pub fn resume(project: &Path) -> std::io::Result<()> {
 pub fn resume_for(project: &Path, asked: std::time::SystemTime) -> std::io::Result<()> {
     let at = asked.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
     let marker = project.join(STOPPED);
-    // No stop: nothing to judge. One written after this look is later than the request anyway.
-    if !marker.is_file() {
-        return Ok(());
-    }
     // Judged in place under the lock: the stop stays visible to `stopped` the whole time, and a stop
-    // or another resume (from any process) waits for this one instead of interleaving with it.
-    let _lock = marker_lock(project)?;
+    // or another resume (from any process) waits for this one instead of interleaving with it. No
+    // lock file: never stopped, and a stop creates it before taking its time, so any stop to come
+    // is later than this request.
+    let _lock = match marker_lock(project, false) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        r => r?,
+    };
     let stopped_at = match std::fs::read_to_string(&marker) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         r => r?.trim().parse::<u128>().ok(),
@@ -200,9 +201,9 @@ pub fn resume_for(project: &Path, asked: std::time::SystemTime) -> std::io::Resu
 
 /// Held while the stop marker is written or judged ([`stop_for`], [`resume_for`]). Holders touch
 /// one small file, and the system frees a lock whose process ended, so a short wait is enough.
-fn marker_lock(project: &Path) -> std::io::Result<std::fs::File> {
+fn marker_lock(project: &Path, create: bool) -> std::io::Result<std::fs::File> {
     let path = project.join("ghidra-stop.lock");
-    let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)?;
+    let file = std::fs::OpenOptions::new().read(true).write(true).create(create).truncate(false).open(&path)?;
     let started = std::time::Instant::now();
     loop {
         match file.try_lock() {
