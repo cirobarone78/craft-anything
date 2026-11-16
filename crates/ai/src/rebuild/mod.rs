@@ -152,6 +152,9 @@ pub struct RunOptions {
     /// A free session is read first; this is the fallback while it is held; the saved settings
     /// are the last fallback.
     pub clean_room: Option<bool>,
+    /// When the person made the request: a stop of Ghidra after it holds even if the run starts
+    /// later (it waited in the queue, or for a key store). Set when the options are made.
+    pub asked: std::time::SystemTime,
 }
 
 impl Default for RunOptions {
@@ -169,6 +172,7 @@ impl Default for RunOptions {
             adapters: Default::default(),
             wake: Wake::default(),
             clean_room: None,
+            asked: std::time::SystemTime::now(),
         }
     }
 }
@@ -388,7 +392,8 @@ impl RebuildRun {
         // Waiting again with files of their own: the builder takes them at its next step or after
         // its turn, and a run that ends first hands them to the next one, as with any note.
         for n in left {
-            run.add_note(n.text, n.shown, n.pictures);
+            let added = n.added.unwrap_or_else(std::time::SystemTime::now);
+            run.add_note_at(n.text, n.shown, n.pictures, added);
         }
         Ok(run)
     }
@@ -402,6 +407,11 @@ impl RebuildRun {
     /// The in-memory text stays raw, and the answers are marked told only when the note is read or
     /// sent.
     pub fn add_note(&self, text: String, shown: String, pictures: Vec<PathBuf>) -> u64 {
+        self.add_note_at(text, shown, pictures, std::time::SystemTime::now())
+    }
+
+    /// [`Self::add_note`] for a note the person added at `added` (one an earlier run left).
+    fn add_note_at(&self, text: String, shown: String, pictures: Vec<PathBuf>, added: std::time::SystemTime) -> u64 {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
         let mut file_text = text.clone();
@@ -419,11 +429,11 @@ impl RebuildRun {
         // Also left for an agent that takes notes at its next step; without it, after the turn.
         // The in-memory note keeps the raw text: if a later run takes it, that run filters the
         // answers by its own mode instead of inheriting this run's.
-        let left = notes::Left { text: text.clone(), shown: shown.clone(), pictures: pictures.clone() };
+        let left = notes::Left { text: text.clone(), shown: shown.clone(), pictures: pictures.clone(), added: Some(added) };
         if let Err(e) = notes::hand_over(&notes::notes_dir(self.inbox.dir()), id, &file_text, Some(&left)) {
             log::warn!("A note waits for the builder's turn to end: {}", e.message);
         }
-        self.notes.lock().unwrap_or_else(PoisonError::into_inner).push(Note { id, text, shown, pictures, questions, added: std::time::SystemTime::now() });
+        self.notes.lock().unwrap_or_else(PoisonError::into_inner).push(Note { id, text, shown, pictures, questions, added });
         id
     }
 
@@ -829,7 +839,7 @@ impl Worker {
             progress.reset();
             progress.save(&ws.root)?;
             // Ghidra, if the person stopped it for this project, may be used again (#948).
-            craft_anything_engine::tools::deep::resume(&ws.root)
+            craft_anything_engine::tools::deep::resume_for(&ws.root, opts.asked)
                 .map_err(|e| ToolError::new(ErrorCode::FileError, format!("Couldn't let Ghidra be used again for this project: {e}")))?;
         }
         // Fail before any work when the agent's tools are missing or it can't sign in.

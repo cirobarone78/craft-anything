@@ -1320,7 +1320,7 @@ fn needs_an_agent_app() {
     let hub = AiHub::with_stores(engine, d.path().join("settings.toml"), crate::KeyStore::file_only(d.path().join("keys.toml")));
     let ws = Workspace::create(d.path(), "x", "y", TargetRef::None).unwrap();
     let dir = notes::notes_dir(&ws.inbox_dir());
-    let left = notes::Left { text: "make it blue".into(), shown: "make it blue".into(), pictures: Vec::new() };
+    let left = notes::Left { text: "make it blue".into(), shown: "make it blue".into(), pictures: Vec::new(), added: None };
     notes::hand_over(&dir, 1, "make it blue", Some(&left)).unwrap();
     let err = RebuildRun::start(&hub, ws, RunOptions::default()).err().unwrap();
     assert!(err.message.contains("coding agent"), "{}", err.message);

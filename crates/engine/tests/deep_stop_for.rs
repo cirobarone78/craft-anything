@@ -109,3 +109,22 @@ fn a_decompile_after_stop_does_not_start_the_analysis_again() {
     let out = call.join().unwrap().unwrap().to_string();
     assert!(out.contains(deep::STOPPED_NOTE), "the builder is told why: {out}");
 }
+
+/// #1903 review: a request made before the stop leaves Ghidra off, one made after it lets it run,
+/// and the stop is set aside before it's read, so nothing is left in the project but the marker.
+#[test]
+fn a_request_from_before_the_stop_keeps_it() {
+    let d = tempfile::Builder::new().prefix("ca").tempdir().unwrap();
+    let root = project(d.path());
+    let before = std::time::SystemTime::now();
+    std::thread::sleep(Duration::from_millis(5));
+    deep::stop_for(&root).unwrap();
+    deep::resume_for(&root, before).unwrap();
+    assert!(deep::stopped(&root), "a request from before the stop doesn't undo it");
+    std::thread::sleep(Duration::from_millis(5));
+    deep::resume_for(&root, std::time::SystemTime::now()).unwrap();
+    assert!(!deep::stopped(&root), "a later request lets Ghidra run");
+    deep::resume_for(&root, std::time::SystemTime::now()).unwrap();
+    let names: Vec<_> = std::fs::read_dir(&root).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert!(!names.iter().any(|n| n.to_string_lossy().starts_with(deep::STOPPED)), "{names:?}");
+}

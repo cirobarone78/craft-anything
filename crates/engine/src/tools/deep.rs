@@ -175,12 +175,24 @@ pub fn resume(project: &Path) -> std::io::Result<()> {
 /// stopped it after making it (a note left waiting while they pressed Stop). A stop with no time
 /// (an older version's) is cleared.
 pub fn resume_for(project: &Path, asked: std::time::SystemTime) -> std::io::Result<()> {
+    static CLAIMS: AtomicU64 = AtomicU64::new(0);
     let at = asked.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
-    let stopped_at = std::fs::read_to_string(project.join(STOPPED)).ok().and_then(|s| s.trim().parse::<u128>().ok());
-    if stopped_at.is_some_and(|s| s > at) {
-        return Ok(());
+    let marker = project.join(STOPPED);
+    // The stop is moved aside before it's read, so a stop made meanwhile (by this or another
+    // process) writes a new marker that this call never removes.
+    let claimed = project.join(format!("{STOPPED}.{}.{}", std::process::id(), CLAIMS.fetch_add(1, Ordering::SeqCst)));
+    match std::fs::rename(&marker, &claimed) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+        Ok(()) => {}
     }
-    resume(project)
+    let stopped_at = std::fs::read_to_string(&claimed).ok().and_then(|s| s.trim().parse::<u128>().ok());
+    if stopped_at.is_some_and(|s| s > at) {
+        // shortcut: putting it back replaces a stop made in the last moment with this earlier,
+        // still-later-than-the-request one; both keep Ghidra off. Use a lock file if that matters.
+        return std::fs::rename(&claimed, &marker);
+    }
+    std::fs::remove_file(&claimed)
 }
 
 /// Whether Ghidra is analysing a program for `project`'s build in this process, and wasn't
