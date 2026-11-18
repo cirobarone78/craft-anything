@@ -1020,6 +1020,22 @@ impl Worker {
                 {
                     ws.manifest.stack = s.name.clone();
                 }
+                // The toolchain that is actually here, from files that exist: a recorded stack whose
+                // own toolchain is gone (a rewrite to another language) gives way when a matching
+                // stack shows. Game engines keep their stack; Rust's game default may change.
+                let engine = game::Builder::from_stack(&ws.manifest.stack);
+                let recorded_tool = stacks::toolchain_for(&ws.manifest.stack);
+                let tool = recorded_tool
+                    .filter(|t| craft_anything_engine::toolchains::built_in_named(&ws.app_dir(), &t.name))
+                    .or_else(|| (engine.is_none() || engine == Some(game::Builder::Rust)).then(|| stacks::built_in(&ws.app_dir())).flatten());
+                ws.manifest.build_toolchain = tool.map(|t| t.name.clone());
+                if (engine.is_none() || engine == Some(game::Builder::Rust))
+                    && let Some(tool) = tool
+                    && recorded_tool.is_none_or(|t| t.name != tool.name)
+                    && let Some(s) = stacks::stack_for_toolchain(&tool.name, &ws.app_dir())
+                {
+                    ws.manifest.stack = s.name.clone();
+                }
                 ws.manifest.awaiting_check = true;
                 ws.save()?;
                 // Keep the finished turn before scanning: a cancellation during the scan

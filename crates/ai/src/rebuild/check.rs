@@ -44,14 +44,15 @@ const UNITY_LICENCE_FIX: &str = "Unity needs its free licence first: open Unity 
 
 /// A person's own project: its engine's build, else its toolchain's, else a static site. One we
 /// know no way to build isn't a failure, and the note says nothing ran.
-pub(super) fn own_build_check(app: &Path, place: &str, stack: &str, editor: Option<&Path>, stop: &CheckStop) -> (bool, String) {
+pub(super) fn own_build_check(app: &Path, place: &str, stack: &str, build_toolchain: Option<&str>, editor: Option<&Path>, stop: &CheckStop) -> (bool, String) {
     let engine = engine_for(stack, app);
     if let (Some(game::Builder::Unity), Some(ed)) = (engine, editor) {
         return own_unity_check(app, ed, stop);
     }
-    match stacks::toolchain_in(app).filter(|_| engine.is_none()) {
+    let tool = stacks::toolchain_for_build(app, stack, build_toolchain);
+    match tool.filter(|_| engine.is_none()) {
         Some(tool) => own_build(app, tool, stop),
-        None if engine.is_some() || static_site(app) => build_check(app, place, stack, editor, stop),
+        None if engine.is_some() || static_site(app) => build_check(app, place, stack, build_toolchain, editor, stop),
         None => (true, "Nothing was built: Craft Anything doesn't know how to build this kind of project.".into()),
     }
 }
@@ -75,6 +76,17 @@ fn own_unity_check(app: &Path, editor: &Path, stop: &CheckStop) -> (bool, String
 fn own_build(app: &Path, tool: &stacks::Toolchain, stop: &CheckStop) -> (bool, String) {
     match run_tool(app, tool, &tool.build, 2 * 60, stop) {
         Ok((true, _)) => (true, format!("`{}` passed.", tool.build.join(" "))),
+        Ok((false, out)) => (false, format!("Build failed: {}", error_lines(&out))),
+        Err(e) => (false, format!("Couldn't run the build: {e}")),
+    }
+}
+
+/// A generated Node project's build, which must have a build script (unlike a person's own
+/// package, where the toolchain's `--if-present` means nothing to build).
+fn node_build(app: &Path, stop: &CheckStop) -> (bool, String) {
+    let npm = Path::new(if cfg!(windows) { "npm.cmd" } else { "npm" });
+    match run_in(app, npm, &["run".into(), "build".into()], 2 * 60, stop) {
+        Ok((true, _)) => (true, "Build succeeded.".into()),
         Ok((false, out)) => (false, format!("Build failed: {}", error_lines(&out))),
         Err(e) => (false, format!("Couldn't run the build: {e}")),
     }
@@ -113,12 +125,24 @@ fn last_lines(out: &str, n: usize) -> String {
 /// For non-website builds: run the project's build (its engine's own, for Unity, Unreal and
 /// Godot) and report whether it succeeded, with a note (the first error lines when it didn't).
 /// `place` says where `app` is, for messages (`Workspace::app_place`).
-pub(super) fn build_check(app: &Path, place: &str, stack: &str, editor: Option<&Path>, stop: &CheckStop) -> (bool, String) {
+pub(super) fn build_check(app: &Path, place: &str, stack: &str, build_toolchain: Option<&str>, editor: Option<&Path>, stop: &CheckStop) -> (bool, String) {
     let run = |prog: &Path, args: &[String], minutes: u64| run_in(app, prog, args, minutes, stop).map_err(|e| format!("Couldn't run the build: {e}"));
     let app_abs = craft_anything_engine::workspace::absolute(app);
     let app_s = app_abs.display().to_string();
     let built = || packaged_program(&app_abs.join("Build")).is_some();
-    let result: Result<(bool, String), String> = match (engine_for(stack, app), editor) {
+    let engine = engine_for(stack, app);
+    // What the build actually used: the recorded toolchain when its files are still here, else the
+    // recorded stack's, else the first toolchain with markers and sources. Game engines keep theirs.
+    let toolchain = (engine.is_none() || engine == Some(game::Builder::Rust)).then(|| stacks::toolchain_for_build(app, stack, build_toolchain)).flatten();
+    if let Some(tool) = toolchain {
+        // A generated Node project needs its build script: the toolchain's `--if-present` is for a
+        // person's own package with nothing to build, not for one the builder made.
+        if tool.name == "Node.js" {
+            return node_build(app, stop);
+        }
+        return own_build(app, tool, stop);
+    }
+    let result: Result<(bool, String), String> = match (engine, editor) {
         (Some(game::Builder::Unity), Some(ed)) => {
             if !app.join("Assets").is_dir() {
                 return (false, missing(app, place, format!("No Unity project found in {place} yet.")));
@@ -408,11 +432,11 @@ mod tests {
         let stop = CheckStop::default();
         let notes = tempfile::tempdir().unwrap();
         std::fs::write(notes.path().join("notes.md"), "ideas").unwrap();
-        let (passed, note) = own_build_check(notes.path(), "the project folder", stacks::BUILDERS_CHOICE, None, &stop);
+        let (passed, note) = own_build_check(notes.path(), "the project folder", stacks::BUILDERS_CHOICE, None, None, &stop);
         assert!(passed && note.starts_with("Nothing was built"), "{note}");
         let site = tempfile::tempdir().unwrap();
         std::fs::write(site.path().join("index.html"), "<p>hi</p>").unwrap();
-        let (passed, note) = own_build_check(site.path(), "the project folder", "Plain HTML and CSS", None, &stop);
+        let (passed, note) = own_build_check(site.path(), "the project folder", "Plain HTML and CSS", None, None, &stop);
         assert!(passed && note.contains("static site"), "{note}");
     }
 
@@ -445,7 +469,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let app = d.path();
         let stop = CheckStop::default();
-        let check = |place| build_check(app, place, "Rust + egui (eframe)", None, &stop);
+        let check = |place| build_check(app, place, "Rust + egui (eframe)", None, None, &stop);
         assert_eq!(check("app/"), (false, "No project to build found in app/ yet.".into()), "nothing anywhere");
         std::fs::create_dir(app.join("notes")).unwrap();
         assert_eq!(check("app/").1, "No project to build found in app/ yet.", "a folder without a project");
@@ -465,7 +489,7 @@ mod tests {
         );
         // The engines' own missing-project notes say it too.
         let unity = Path::new("C:/Engines/Unity/Editor/Unity.exe");
-        let note = build_check(app, "app/", "Unity", Some(unity), &stop).1;
+        let note = build_check(app, "app/", "Unity", None, Some(unity), &stop).1;
         assert!(note.starts_with("No Unity project found in app/ yet. There's a Cargo.toml one folder down, in app/app/"), "{note}");
     }
 
@@ -490,7 +514,7 @@ mod tests {
         std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let stop = CheckStop::default();
-        assert!(build_check(app, "app/", "Unity", Some(&editor), &stop).0);
+        assert!(build_check(app, "app/", "Unity", None, Some(&editor), &stop).0);
         let args = std::fs::read_to_string(app.join("args.txt")).unwrap();
         let project = args.lines().skip_while(|l| *l != "-projectPath").nth(1).unwrap();
         assert!(Path::new(project).is_absolute(), "{project}");
@@ -509,7 +533,7 @@ mod tests {
         let app = d.path();
         let stop = CheckStop::default();
         let passed = (true, "Nothing to build: a static site.".to_string());
-        let check = |stack, editor| build_check(app, "app/", stack, editor, &stop);
+        let check = |stack, editor| build_check(app, "app/", stack, None, editor, &stop);
         assert!(!check("Plain HTML and CSS", None).0, "nothing there yet");
 
         // #496: the page itself, with no manifest.
@@ -546,6 +570,25 @@ mod tests {
         let built = tempfile::tempdir().unwrap();
         std::fs::create_dir(built.path().join("dist")).unwrap();
         std::fs::write(built.path().join("dist").join("index.html"), "<h1>Hello</h1>").unwrap();
-        assert_eq!(build_check(built.path(), "app/", "Builder's choice", None, &stop), passed);
+        assert_eq!(build_check(built.path(), "app/", "Builder's choice", None, None, &stop), passed);
+    }
+
+    /// R2.9/#1837: a stale Cargo.toml beside Python sources is checked with Python, not Cargo.
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_manifest_is_checked_with_the_toolchain_that_has_sources() {
+        let d = tempfile::tempdir().unwrap();
+        let app = d.path();
+        std::fs::write(app.join("Cargo.toml"), "[package]\nname = \"stale\"\n").unwrap();
+        std::fs::write(app.join("main.py"), "print('hi')\n").unwrap();
+        let stop = CheckStop::default();
+        let (passed, note) = build_check(app, "app/", "Rust + egui (eframe)", Some("Python"), None, &stop);
+        assert!(passed, "{note}");
+        assert!(note.contains("compileall"), "the Python toolchain ran, not cargo: {note}");
+        assert!(!note.contains("cargo"), "{note}");
+        let (passed, note) = build_check(app, "app/", "Rust + egui (eframe)", None, None, &stop);
+        assert!(passed && note.contains("compileall"), "the recorded stack's own toolchain is gone: {note}");
+        let (passed, note) = build_check(app, "app/", "Python", None, None, &stop);
+        assert!(passed && note.contains("compileall"), "{note}");
     }
 }

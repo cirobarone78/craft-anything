@@ -9,6 +9,10 @@ pub struct Toolchain {
     pub name: String,
     /// Files that name it: exact relative paths or a root filename suffix such as `*.csproj`.
     pub found_by: Vec<String>,
+    /// File suffixes that show the project has something to build inside it (`*.rs`, `*.py`),
+    /// scanned below its folder and skipping build output. Empty means the marker is enough.
+    #[serde(default)]
+    pub sources: Vec<String>,
     /// The program that builds it and its arguments, run in the project's folder.
     #[serde(default)]
     pub build: Vec<String>,
@@ -71,6 +75,74 @@ pub fn found_in(dir: &Path) -> Option<&'static Toolchain> {
         .iter()
         .find(|t| t.found_by.iter().any(|pattern| !matching_files(dir, pattern).is_empty()))
         .or_else(|| catalogue().iter().find(|t| t.standalone_entrypoints && t.launch.iter().any(|r| !r.file.contains('*') && dir.join(&r.file).is_file())))
+}
+
+/// The toolchain with this name.
+pub fn get(name: &str) -> Option<&'static Toolchain> {
+    catalogue().iter().find(|t| t.name == name)
+}
+
+/// The first toolchain whose marker and source files show a project that can be built here: the
+/// marker says what it is, the sources say there is something to build. A leftover Cargo.toml
+/// without Rust sources isn't one. A script-only Python project counts from its root entrypoint.
+pub fn built_in(dir: &Path) -> Option<&'static Toolchain> {
+    catalogue()
+        .iter()
+        .find(|t| built_in_one(t, dir))
+        .or_else(|| catalogue().iter().find(|t| t.standalone_entrypoints && root_entrypoint(dir, t) && sources_present(t, dir)))
+}
+
+/// Whether `name`'s toolchain has its marker and source files here.
+pub fn built_in_named(dir: &Path, name: &str) -> bool {
+    get(name).is_some_and(|t| built_in_one(t, dir) || (t.standalone_entrypoints && root_entrypoint(dir, t) && sources_present(t, dir)))
+}
+
+fn built_in_one(tool: &Toolchain, dir: &Path) -> bool {
+    tool.found_by.iter().any(|pattern| !matching_files(dir, pattern).is_empty()) && sources_present(tool, dir)
+}
+
+fn sources_present(tool: &Toolchain, dir: &Path) -> bool {
+    tool.sources.is_empty() || tool.sources.iter().any(|pattern| has_source_file(dir, pattern, &tool.name))
+}
+
+fn root_entrypoint(dir: &Path, tool: &Toolchain) -> bool {
+    tool.launch.iter().any(|recipe| !recipe.file.contains('*') && dir.join(&recipe.file).is_file())
+}
+
+/// The caps on the source scan, so a hostile tree can't stall a check.
+const SOURCE_SCAN_DEPTH: usize = 6;
+const SOURCE_SCAN_FILES: usize = 20_000;
+/// Output folders no toolchain's sources live in.
+const SOURCE_SKIPPED: &[&str] = &["target", "node_modules", ".git", ".venv", "venv", "dist", "out", "__pycache__", ".next", ".cargo"];
+
+/// Whether a file ending in `pattern`'s suffix exists below `dir`, skipping build output.
+/// `.NET` also skips `bin` and `obj`; a Rust package's `src/bin` is source, not output.
+fn has_source_file(dir: &Path, pattern: &str, toolchain: &str) -> bool {
+    let suffix = pattern.strip_prefix('*').unwrap_or(pattern);
+    let dotnet_output = |name: &str| toolchain == ".NET" && matches!(name, "bin" | "obj");
+    let mut stack = vec![(dir.to_path_buf(), 0usize)];
+    let mut seen = 0usize;
+    while let Some((folder, depth)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&folder) else { continue };
+        for entry in entries.flatten() {
+            seen += 1;
+            if seen > SOURCE_SCAN_FILES {
+                return false;
+            }
+            let Ok(kind) = entry.file_type() else { continue };
+            if kind.is_dir() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                let name = name.as_ref();
+                if depth < SOURCE_SCAN_DEPTH && !SOURCE_SKIPPED.contains(&name) && !dotnet_output(name) {
+                    stack.push((entry.path(), depth + 1));
+                }
+            } else if kind.is_file() && entry.file_name().to_string_lossy().ends_with(suffix) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Match exact files, suffixes in a fixed directory (`*.csproj`, `target/*.jar`), or one named

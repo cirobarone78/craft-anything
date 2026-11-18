@@ -18,6 +18,10 @@ use std::time::{Duration, Instant};
 const PROTOCOL: &str = "2025-06-18";
 /// Largest single message we accept from a server.
 const MAX_LINE: usize = 16 * 1024 * 1024;
+/// How long a server that closed its input gets to finish, so its exit code and the end of what
+/// it printed reach the error instead of a bare pipe error. The supervisor publishes a run only
+/// after draining its output, which a loaded machine can delay past a moment.
+const EXIT_WAIT: Duration = Duration::from_secs(5);
 
 /// How to start a local server.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,11 +115,12 @@ impl McpClient {
         }
     }
 
-    /// For a server that stopped answering (`TimedOut` without details): stop it and add the end of
-    /// what it printed to the error, as `details.output_tail` and in its remediation. The client
-    /// can't be used after this; any other error is returned as it is.
+    /// Stop a local server that failed to start or stopped answering and add the end of what it
+    /// printed to the error, as `details.output_tail` and in its remediation, so a pipe error never
+    /// hides the output a person needs. A remote server, a stop, and an error that already carries
+    /// its output are returned as they are. The client can't be used after this.
     pub fn with_output(&mut self, e: ToolError) -> ToolError {
-        if e.code != ErrorCode::TimedOut || e.details.is_some() {
+        if e.code == ErrorCode::Cancelled || e.details.is_some() {
             return e;
         }
         let Some(printed) = self.transport.stop_for_output().filter(|p| !p.trim().is_empty()) else { return e };
@@ -227,29 +232,44 @@ impl Stdio {
     /// The server is gone: its exit code and the end of what it printed, when the run has them.
     fn exited(&mut self) -> ToolError {
         let fix = "Check its command in config.toml ([[plugins.mcp]]).";
-        let Some(Ok(out)) = self.process.wait_timeout(Duration::from_millis(500)) else {
+        // The supervisor publishes a run only after draining its output, so wait for it rather
+        // than lose what the server printed to a scheduling delay.
+        let Some(out) = self.process.wait_timeout(EXIT_WAIT) else {
             return ToolError::new(ErrorCode::EngineMissing, format!("The {} plugin exited.", self.name)).with_remediation(fix);
         };
-        let code = out.code.map(|c| format!(" with exit code {c}")).unwrap_or_default();
-        let printed = craft_anything_platform::process::output_excerpt(&out.end_text());
+        let (message, code, printed) = match out {
+            Ok(out) => {
+                let code = out.code.map(|c| format!(" with exit code {c}")).unwrap_or_default();
+                (format!("The {} plugin exited{code}.", self.name), out.code, craft_anything_platform::process::output_excerpt(&out.end_text()))
+            }
+            // A run that was stopped keeps what it had printed in `details.partial`.
+            Err(e) => (format!("The {} plugin stopped.", self.name), None, craft_anything_platform::process::output_excerpt(&partial_text(e))),
+        };
         let said = if printed.is_empty() { format!("It printed nothing. {fix}") } else { format!("What it printed last:\n{printed}\n\n{fix}") };
-        ToolError::new(ErrorCode::EngineMissing, format!("The {} plugin exited{code}.", self.name))
-            .with_remediation(said)
-            .with_details(json!({"exit_code": out.code, "output_tail": printed}))
+        ToolError::new(ErrorCode::EngineMissing, message).with_remediation(said).with_details(json!({"exit_code": code, "output_tail": printed}))
     }
 }
 
+/// What a run that was stopped (or lost) had printed, from its error's `details.partial`: stderr
+/// unless it's blank, as `Output::end_text` does.
+fn partial_text(e: &ToolError) -> String {
+    let part = |name: &str| e.details.as_ref().and_then(|d| d.pointer(&format!("/partial/{name}"))).and_then(Value::as_str).unwrap_or_default();
+    let stderr = part("stderr_tail");
+    if stderr.trim().is_empty() { part("stdout_tail").to_string() } else { stderr.to_string() }
+}
+
 impl Transport for Stdio {
+    /// Stop the server and return the end of what it printed, for an error that has nothing else.
     fn stop_for_output(&mut self) -> Option<String> {
         self.process.kill_and_wait(Duration::from_secs(2));
         let printed = match self.process.try_result()? {
             Ok(out) => out.end_text(),
-            // A stopped run keeps what it had printed in `details.partial`.
-            Err(e) => e.details.as_ref()?.pointer("/partial/stderr_tail")?.as_str()?.to_string(),
+            Err(e) => partial_text(e),
         };
         Some(craft_anything_platform::process::output_excerpt(&printed))
     }
 
+    /// Send one message to the server; a failed write means it has gone.
     fn notify(&mut self, msg: &Value) -> Result<(), ToolError> {
         let mut line = msg.to_string();
         line.push('\n');
@@ -258,9 +278,10 @@ impl Transport for Stdio {
             .write_all(line.as_bytes())
             .and_then(|()| self.stdin.flush())
             .map_err(|e| ToolError::new(ErrorCode::EngineMissing, format!("The {} plugin stopped: {e}", self.name)));
-        // A write fails when the server has already exited: say what it printed instead.
-        // The supervisor may not have published the exit yet, so wait for it a moment.
-        if sent.is_err() && self.process.wait_timeout(Duration::from_millis(500)).is_some() {
+        // A write fails when the server has already exited: say what it printed instead. The
+        // supervisor may not have published the exit yet, so wait for it rather than let the pipe
+        // error replace the exit code and output.
+        if sent.is_err() && self.process.wait_timeout(EXIT_WAIT).is_some() {
             return Err(self.exited());
         }
         sent
@@ -453,6 +474,28 @@ mod tests {
         let t: RemoteTool = serde_json::from_value(json!({"name": "echo", "inputSchema": {"type": "object"}, "extra": 1})).unwrap();
         assert_eq!(t.name, "echo");
         assert!(t.annotations.is_null());
+    }
+
+    /// A server that closed its input before the handshake: the pipe error keeps what it printed.
+    #[test]
+    fn a_broken_pipe_keeps_what_the_server_printed() {
+        struct Gone;
+        impl Transport for Gone {
+            fn notify(&mut self, _msg: &Value) -> Result<(), ToolError> {
+                Ok(())
+            }
+            fn request(&mut self, _msg: &Value, _id: u64, _deadline: Instant, _cancelled: &dyn Fn() -> bool) -> Result<Value, ToolError> {
+                Err(ToolError::new(ErrorCode::EngineMissing, "The demo plugin stopped: Broken pipe (os error 32)"))
+            }
+            fn stop_for_output(&mut self) -> Option<String> {
+                Some("bad token in notes.cfg".into())
+            }
+        }
+        let err = McpClient::with_transport("demo", Box::new(Gone), Duration::from_secs(1)).err().unwrap();
+        assert_eq!(err.code, ErrorCode::EngineMissing);
+        assert!(err.message.contains("Broken pipe"), "{err:?}");
+        assert!(err.remediation.as_deref().unwrap_or_default().contains("bad token in notes.cfg"), "{err:?}");
+        assert_eq!(err.details.as_ref().and_then(|d| d["output_tail"].as_str()), Some("bad token in notes.cfg"));
     }
 
     #[test]

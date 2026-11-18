@@ -40,9 +40,12 @@ pub struct Stack {
     pub program: Option<String>,
     #[serde(default)]
     pub program_from: Option<String>,
+    /// The `[[toolchain]]` row that builds it (`Rust`, `Python`, `Node.js`…), if one names it.
+    #[serde(default)]
+    pub toolchain: Option<String>,
 }
 
-pub use craft_anything_engine::toolchains::{Toolchain, found_in as toolchain_in};
+pub use craft_anything_engine::toolchains::{Toolchain, built_in, found_in as toolchain_in};
 
 /// The stack that leaves the choice to the builder (a website's default); [`used_in`] then
 /// records the one it used.
@@ -137,6 +140,44 @@ fn has_file(dir: &std::path::Path, name: &str) -> bool {
         Some(ending) => std::fs::read_dir(dir).into_iter().flatten().flatten().any(|e| e.file_name().to_string_lossy().ends_with(ending)),
         None => dir.join(name).is_file(),
     }
+}
+
+/// The toolchain that builds `stack`, when the table names one.
+pub fn toolchain_for(stack: &str) -> Option<&'static Toolchain> {
+    craft_anything_engine::toolchains::get(get(stack)?.toolchain.as_deref()?)
+}
+
+/// The stack to record for `toolchain` that was built in `app`: the first stack with that
+/// toolchain whose declared dependencies or files are here, then the toolchain's own default
+/// (Python, or Rust's console stack). None for a toolchain with no stack row (Go, .NET, Maven,
+/// Gradle, Make): the recorded toolchain still tells the check. It searches every stack rather
+/// than taking the first stack from either dependency file, so a stale package.json can't hide a
+/// matching Cargo dependency.
+pub fn stack_for_toolchain(toolchain: &str, app: &std::path::Path) -> Option<&'static Stack> {
+    let mut deps = craft_anything_engine::outputs::npm_dependencies(app);
+    deps.extend(craft_anything_engine::outputs::cargo_dependencies(app));
+    catalogue()
+        .iter()
+        .find(|s| s.toolchain.as_deref() == Some(toolchain) && s.uses.iter().any(|d| deps.contains(d)))
+        .or_else(|| catalogue().iter().find(|s| s.toolchain.as_deref() == Some(toolchain) && s.found_by.iter().any(|f| has_file(app, f))))
+        .or_else(|| match toolchain {
+            "Python" => get("Python"),
+            "Rust" => get("Rust (console)"),
+            _ => None,
+        })
+}
+
+/// The toolchain to build or test `app` with, in precedence order: the recorded build toolchain
+/// when its files are here, the recorded stack's toolchain when its files are here, the first
+/// source-backed toolchain, then the marker-only fallback for a project whose sources aren't
+/// written yet. Shared by the build and own-tests checks so they agree.
+pub fn toolchain_for_build(app: &std::path::Path, stack: &str, build_toolchain: Option<&str>) -> Option<&'static Toolchain> {
+    build_toolchain
+        .and_then(craft_anything_engine::toolchains::get)
+        .filter(|t| craft_anything_engine::toolchains::built_in_named(app, &t.name))
+        .or_else(|| toolchain_for(stack).filter(|t| craft_anything_engine::toolchains::built_in_named(app, &t.name)))
+        .or_else(|| built_in(app))
+        .or_else(|| toolchain_in(app))
 }
 
 /// The libraries `request` asks for that work with `stack`, in table order.
@@ -236,12 +277,121 @@ mod tests {
         for b in craft_anything_engines::game::Builder::ALL {
             assert!(get(b.stack()).is_some(), "no stack in stacks.toml for {}", b.stack());
         }
+        for s in catalogue() {
+            if let Some(t) = &s.toolchain {
+                assert!(craft_anything_engine::toolchains::get(t).is_some(), "{} names unknown toolchain {t}", s.name);
+            }
+        }
         assert_eq!(get("Unity").and_then(|s| s.engine.as_deref()), Some("unity"));
         assert!(parse("[[stack]]\nname = 3").is_err(), "a broken table is an error, not a panic");
         for l in &table().library {
             assert!(!l.steps.is_empty() && !l.asked_by.is_empty(), "{l:?}");
             assert!(l.stacks.iter().all(|s| get(s).is_some()), "{} names a stack that isn't in the table", l.name);
         }
+    }
+
+    /// R2.9: a marker with no source of its own doesn't count as built; another language's
+    /// sources do, so a stale Cargo.toml gives way to a Python entrypoint.
+    #[test]
+    fn a_folder_is_built_with_a_toolchain_only_when_its_sources_are_there() {
+        let built = |files: &[(&str, &str)]| {
+            let d = tempfile::tempdir().unwrap();
+            for (name, text) in files {
+                let p = d.path().join(name);
+                if let Some(parent) = p.parent() {
+                    std::fs::create_dir_all(parent).unwrap();
+                }
+                std::fs::write(p, text).unwrap();
+            }
+            built_in(d.path()).map(|t| t.name.as_str())
+        };
+        assert_eq!(built(&[("Cargo.toml", "")]), None, "a manifest without sources isn't built");
+        assert_eq!(built(&[("Cargo.toml", ""), ("src/main.rs", "")]), Some("Rust"));
+        assert_eq!(built(&[("Cargo.toml", ""), ("src/bin/cli.rs", "")]), Some("Rust"), "src/bin is Rust source, not output");
+        assert_eq!(built(&[("Cargo.toml", ""), ("main.py", "")]), Some("Python"), "a stale Cargo.toml gives way to Python");
+        assert_eq!(built(&[("package.json", ""), ("index.ts", "")]), Some("Node.js"));
+        assert_eq!(built(&[("pyproject.toml", ""), ("app.py", "")]), Some("Python"));
+        assert_eq!(built(&[("go.mod", ""), ("main.go", "")]), Some("Go"));
+        assert_eq!(built(&[("App.csproj", ""), ("Program.cs", "")]), Some(".NET"));
+        assert_eq!(built(&[("App.csproj", ""), ("bin/Generated.cs", "")]), None, ".NET build output isn't source");
+        assert_eq!(built(&[("pom.xml", ""), ("src/Main.java", "")]), Some("Maven"));
+        assert_eq!(built(&[("build.gradle", ""), ("src/main/groovy/App.groovy", "")]), Some("Gradle"), "Groovy is Gradle source");
+        assert_eq!(built(&[("Makefile", "")]), Some("Make"));
+        assert_eq!(built(&[("main.py", "")]), Some("Python"), "a root entrypoint alone");
+        assert_eq!(built(&[("notes.md", "")]), None);
+
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("Cargo.toml"), "").unwrap();
+        assert!(!craft_anything_engine::toolchains::built_in_named(d.path(), "Rust"), "no sources, no build");
+        std::fs::create_dir_all(d.path().join("src")).unwrap();
+        std::fs::write(d.path().join("src/main.rs"), "").unwrap();
+        assert!(craft_anything_engine::toolchains::built_in_named(d.path(), "Rust"));
+    }
+
+    #[test]
+    fn stacks_name_the_toolchain_that_builds_them() {
+        assert_eq!(toolchain_for("Python").map(|t| t.name.as_str()), Some("Python"));
+        assert_eq!(toolchain_for("Rust + egui (eframe)").map(|t| t.name.as_str()), Some("Rust"));
+        assert_eq!(toolchain_for("React + TypeScript (Vite)").map(|t| t.name.as_str()), Some("Node.js"));
+        assert_eq!(toolchain_for("Unity"), None);
+    }
+
+    #[test]
+    fn a_recorded_toolchain_names_the_stack_to_show() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("main.py"), "").unwrap();
+        assert_eq!(stack_for_toolchain("Python", d.path()).map(|s| s.name.as_str()), Some("Python"));
+        std::fs::write(d.path().join("Cargo.toml"), "[dependencies]\neframe = \"0.30\"\n").unwrap();
+        std::fs::create_dir_all(d.path().join("src")).unwrap();
+        std::fs::write(d.path().join("src/main.rs"), "").unwrap();
+        assert_eq!(stack_for_toolchain("Rust", d.path()).map(|s| s.name.as_str()), Some("Rust + egui (eframe)"), "the stack its Cargo dependencies name");
+        assert_eq!(stack_for_toolchain("Go", d.path()), None, "Go has no stack row");
+    }
+
+    /// R2.9 review: a stack named by one dependency file must not stop the search before another
+    /// file names the matching stack for the toolchain that was built.
+    #[test]
+    fn a_matching_stack_is_found_after_another_stack_from_used_in() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("package.json"), r#"{"dependencies": {"next": "16", "react": "19"}}"#).unwrap();
+        std::fs::write(d.path().join("Cargo.toml"), "[dependencies]\neframe = \"0.37\"\n").unwrap();
+        assert_eq!(used_in(d.path()).map(|s| s.name.as_str()), Some("Next.js + TypeScript"), "the stale package.json names a stack");
+        assert_eq!(stack_for_toolchain("Node.js", d.path()).map(|s| s.name.as_str()), Some("Next.js + TypeScript"));
+        assert_eq!(stack_for_toolchain("Rust", d.path()).map(|s| s.name.as_str()), Some("Rust + egui (eframe)"), "the Cargo stack is still found");
+    }
+
+    #[test]
+    fn the_toolchain_choice_follows_the_recorded_one_when_its_files_are_here() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("Cargo.toml"), "[dependencies]\neframe = \"0.37\"\n").unwrap();
+        std::fs::create_dir_all(d.path().join("src")).unwrap();
+        std::fs::write(d.path().join("src/main.rs"), "").unwrap();
+        assert_eq!(toolchain_for_build(d.path(), "Rust + egui (eframe)", Some("Rust")).map(|t| t.name.as_str()), Some("Rust"));
+        assert_eq!(
+            toolchain_for_build(d.path(), "Rust + egui (eframe)", Some("Python")).map(|t| t.name.as_str()),
+            Some("Rust"),
+            "an invalid recorded toolchain gives way to the stack's"
+        );
+        let both = tempfile::tempdir().unwrap();
+        std::fs::write(both.path().join("Cargo.toml"), "[dependencies]\neframe = \"0.37\"\n").unwrap();
+        std::fs::create_dir_all(both.path().join("src")).unwrap();
+        std::fs::write(both.path().join("src/main.rs"), "").unwrap();
+        std::fs::write(both.path().join("main.py"), "").unwrap();
+        assert_eq!(
+            toolchain_for_build(both.path(), "Rust + egui (eframe)", Some("Python")).map(|t| t.name.as_str()),
+            Some("Python"),
+            "a valid recorded toolchain wins even when the stack's is also valid"
+        );
+        let python = tempfile::tempdir().unwrap();
+        std::fs::write(python.path().join("main.py"), "").unwrap();
+        assert_eq!(toolchain_for_build(python.path(), "Rust + egui (eframe)", None).map(|t| t.name.as_str()), Some("Python"));
+        let marker = tempfile::tempdir().unwrap();
+        std::fs::write(marker.path().join("Cargo.toml"), "[package]\nname = \"new\"\n").unwrap();
+        assert_eq!(
+            toolchain_for_build(marker.path(), "Rust + egui (eframe)", None).map(|t| t.name.as_str()),
+            Some("Rust"),
+            "a project whose sources aren't written yet keeps the marker-only fallback"
+        );
     }
 
     #[test]
