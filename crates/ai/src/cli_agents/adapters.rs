@@ -422,6 +422,15 @@ fn no_such_session(v: &Value) -> bool {
     turns == 0 && (v.get("errors").and_then(Value::as_array).is_some_and(|a| a.iter().any(named)) || v.get("result").is_some_and(named))
 }
 
+/// How Claude Code's result says its conversation no longer fits the model's context. Nothing
+/// more can be sent to that session, so resuming it again only repeats the refusal (#2042).
+const SESSION_FULL: &str = "Prompt is too long";
+
+/// A failed result that only says the conversation has grown too long to take another message.
+fn session_full(v: &Value) -> bool {
+    v.get("result").and_then(Value::as_str).is_some_and(|r| r.trim().starts_with(SESSION_FULL))
+}
+
 /// Claude Code in headless mode (flags checked against `claude --help`).
 #[derive(Default)]
 pub struct ClaudeCode {
@@ -610,6 +619,14 @@ impl AgentAdapter for ClaudeCode {
                             "It was started on another computer or in another folder. Ask again: a new conversation starts from what the project already has."
                                 .into(),
                         ),
+                        log: None,
+                    });
+                } else if v.get("is_error").and_then(Value::as_bool).unwrap_or(false) && session_full(v) {
+                    // Like a session that isn't here: the next message starts a new one.
+                    p.session_missing = true;
+                    out.push(AgentEvent::Error {
+                        message: "Claude Code's conversation about this project has grown too long to continue.".into(),
+                        remediation: Some("Ask again: a new conversation starts from what the project already has.".into()),
                         log: None,
                     });
                 } else if v.get("is_error").and_then(Value::as_bool).unwrap_or(false) {

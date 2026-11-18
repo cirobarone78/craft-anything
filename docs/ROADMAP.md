@@ -1746,6 +1746,12 @@ Gaps found while using the app for real projects.
       with a plain error, while files at or under the cap page as before. The regression covers
       the cap and the boundary
       — claimed: AlexJoaquimPereira, branch bugfix/r2.9-build-file-read-cap
+- [x] A Claude Code conversation that had grown too long stopped every later turn with "Prompt is
+      too long", and Try again resumed the same conversation (#2042). That refusal is now treated
+      like a saved conversation that isn't on this computer: the next message starts a new one from
+      what the project already has. Checked by a parser test on the result line; the exact line
+      Claude Code prints wasn't captured from a live run
+      — claimed: bflatastic, branch bugfix/claude-session-too-long
 - [x] `build_file_edit` read the whole project file into memory before replacing text; it now
       uses the same 16 MiB cap as a read, refusing a larger file before it is loaded and leaving
       it unchanged. A file at the cap still edits when the result fits the 8 MB write cap. Engine
