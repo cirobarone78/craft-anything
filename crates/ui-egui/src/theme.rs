@@ -521,6 +521,9 @@ const SCROLL_THUMB_AT_REST: f32 = 0.5;
 /// two or three turns for what a browser scrolls in one; it still eases to the new place.
 pub const WHEEL_STEP: f32 = 100.0;
 
+/// The most height a draft can use before the prompt box scrolls, in points.
+pub const PROMPT_VIEWPORT_MAX: f32 = 208.0;
+
 /// Apply a theme. `roomy` = Beginner mode (bigger type, more air).
 pub fn apply(ctx: &egui::Context, kind: ThemeKind, roomy: bool) {
     let t = Tokens::for_kind(kind);

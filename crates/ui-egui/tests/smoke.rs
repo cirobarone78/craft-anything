@@ -2302,8 +2302,24 @@ fn the_prompt_box_is_laid_out_with_its_new_height_in_the_frame_it_grows() {
     h.run_steps(2);
     h.state_mut().open_workspace(a);
     h.run_steps(3);
-    let bottom = |h: &Harness<'static, CraftApp>| h.get_by_label("Ask for a change").rect().max.y;
-    let before = bottom(&h);
+    let field = |h: &Harness<'static, CraftApp>| h.get_by_label("Ask for a change").rect();
+    let bottom = |h: &Harness<'static, CraftApp>| field(h).bottom();
+    let draft_rects = |h: &Harness<'static, CraftApp>| {
+        h.output()
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == h.state().state.project_input => {
+                    Some((text.galley.rect.translate(text.pos.to_vec2()), shape.clip_rect))
+                }
+                _ => None,
+            })
+            .expect("the draft is painted")
+    };
+    let send_bottom = |h: &Harness<'static, CraftApp>| h.get_by_label("Send (Enter)").rect().bottom();
+    let compact = field(&h);
+    let before = compact.bottom();
+    let before_send = send_bottom(&h);
     // Five more lines at once: the very next frame shown already has the taller box in place,
     // not one laid out with last frame's height (which pushed it off the bottom, then back).
     h.state_mut().state.project_input = "one
@@ -2315,9 +2331,40 @@ six"
     .into();
     h.step();
     let after = bottom(&h);
+    let (draft, clip) = draft_rects(&h);
+    assert!(draft.top() >= clip.top() && draft.bottom() <= clip.bottom(), "all six lines should be visible: draft {draft:?}, clip {clip:?}");
     h.run_steps(3);
     assert!((after - bottom(&h)).abs() < 0.5, "the box didn't move after the frame it grew in: {after} then {}", bottom(&h));
     assert!((after - before).abs() < 0.5, "it grows upwards, keeping its bottom edge: {before} then {after}");
+
+    h.state_mut().state.project_input = "A long prompt wraps without hard line breaks. ".repeat(100);
+    h.run_steps(3);
+    let (draft, clip) = draft_rects(&h);
+    assert!(draft.height() > clip.height() && clip.height() > 180.0, "soft wraps fill the box and scroll at the cap: draft {draft:?}, clip {clip:?}");
+    assert!((send_bottom(&h) - before_send).abs() < 0.5, "overflow leaves Send in place");
+
+    h.state_mut().state.project_input.clear();
+    h.run_steps(3);
+    assert!((field(&h).height() - compact.height()).abs() < 0.5, "clearing restores the compact box");
+}
+
+#[test]
+fn a_long_draft_leaves_send_visible_below_the_plan_in_a_short_window() {
+    use craft_anything_ui_egui::state::{FeedItem, PlanStatus, PlanStep};
+    let mut h = harness_sized(egui::vec2(760.0, 650.0), || {
+        let mut app = demo::app(demo::engine(Mode::Beginner, true));
+        demo::fill_project(&mut app);
+        let steps = (1..=40).map(|n| PlanStep { text: format!("Step {n}"), doing: String::new(), status: PlanStatus::Todo }).collect();
+        app.state.feed.push(FeedItem::Plan(steps));
+        app
+    });
+    h.run_steps(6);
+    let before = h.get_by_label("Send (Enter)").rect();
+    assert!(before.bottom() <= 650.0, "Send starts in the window: {before:?}");
+    h.state_mut().state.project_input = ["A long draft in a short pane."; 60].join("\n");
+    h.run_steps(6);
+    let after = h.get_by_label("Send (Enter)").rect();
+    assert!(after.bottom() <= 650.0, "Send stays in the window: {after:?}");
 }
 
 #[test]
