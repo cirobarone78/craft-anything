@@ -67,24 +67,21 @@ pub fn catalogue() -> &'static [Toolchain] {
 
 /// The first toolchain whose marker files exist in this folder.
 pub fn found_in(dir: &Path) -> Option<&'static Toolchain> {
-    catalogue()
-        .iter()
-        .find(|t| t.found_by.iter().any(|pattern| !matching_files(dir, pattern).is_empty()))
-        .or_else(|| catalogue().iter().find(|t| t.standalone_entrypoints && t.launch.iter().any(|r| !r.file.contains('*') && dir.join(&r.file).is_file())))
+    catalogue().iter().find(|t| t.is_in(dir)).or_else(|| catalogue().iter().find(|t| t.has_entrypoint(dir)))
 }
 
 /// Match exact files, suffixes in a fixed directory (`*.csproj`, `target/*.jar`), or one named
 /// file below each child of a fixed directory (`cmd/*/main.go`, `*/__main__.py`).
-fn matching_files(dir: &Path, pattern: &str) -> Vec<PathBuf> {
+fn matching_files(dir: &Path, pattern: &str, first: bool) -> Vec<PathBuf> {
     if let Some((folder, filename)) = pattern.split_once("*/") {
-        return scan_entries(&dir.join(folder), |entry| {
+        return scan_entries(&dir.join(folder), first, |entry| {
             let file = entry.path().join(filename);
             Ok((entry.file_type()?.is_dir() && file.is_file()).then_some(file))
         });
     }
     let (folder, name) = pattern.rsplit_once('/').unwrap_or(("", pattern));
     if let Some(suffix) = name.strip_prefix('*') {
-        return scan_entries(&dir.join(folder), |entry| {
+        return scan_entries(&dir.join(folder), first, |entry| {
             let file = entry.path();
             Ok((entry.file_name().to_string_lossy().ends_with(suffix) && file.is_file()).then_some(file))
         });
@@ -93,22 +90,47 @@ fn matching_files(dir: &Path, pattern: &str) -> Vec<PathBuf> {
     file.is_file().then_some(file).into_iter().collect()
 }
 
-fn scan_entries(dir: &Path, candidate: impl Fn(std::fs::DirEntry) -> std::io::Result<Option<PathBuf>>) -> Vec<PathBuf> {
+/// The matching entries in `dir`. A launch reads the first 256 and needs them all, to know its
+/// file is the only one; `first`, all a marker needs, stops at the first match and reads up to
+/// 10,000, so a project file in a folder of many assets is still found.
+fn scan_entries(dir: &Path, first: bool, candidate: impl Fn(std::fs::DirEntry) -> std::io::Result<Option<PathBuf>>) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else { return files };
+    let cap = if first { 10_000 } else { 256 };
     for (i, entry) in entries.enumerate() {
         // A partial scan cannot establish that the entrypoint is unique.
-        if i >= 256 {
+        if i >= cap {
             return Vec::new();
         }
         let Ok(file) = entry.and_then(&candidate) else { return Vec::new() };
         files.extend(file);
+        if first && !files.is_empty() {
+            return files;
+        }
     }
     files.sort();
     files
 }
 
 impl Toolchain {
+    /// Whether one of the files that name it is in `dir`.
+    pub fn is_in(&self, dir: &Path) -> bool {
+        self.found_by.iter().any(|pattern| !matching_files(dir, pattern, true).is_empty())
+    }
+
+    /// Whether `dir` is a script-only project of it: a fixed launch file such as `main.py`.
+    pub fn has_entrypoint(&self, dir: &Path) -> bool {
+        self.standalone_entrypoints && self.launch.iter().any(|r| !r.file.contains('*') && dir.join(&r.file).is_file())
+    }
+
+    /// The files in `dir` that say a project is written with it: the first match of each marker
+    /// (`go.mod`, a `.csproj`) and its fixed launch files (`main.py`, `main.go`).
+    pub fn marker_files(&self, dir: &Path) -> Vec<PathBuf> {
+        let markers = self.found_by.iter().flat_map(|pattern| matching_files(dir, pattern, true));
+        let launch = self.launch.iter().filter(|r| !r.file.contains('*')).map(|r| dir.join(&r.file)).filter(|p| p.is_file());
+        markers.chain(launch).collect()
+    }
+
     /// Resolve a command, preferring the project's own interpreter/build wrapper on this OS.
     pub fn command(&self, app: &Path, command: &[String]) -> Option<(PathBuf, Vec<String>)> {
         self.command_for(app, command, cfg!(windows))
@@ -132,7 +154,7 @@ impl Toolchain {
     /// Infer a launch only from a recipe's unambiguous entrypoint. Never guess among projects.
     pub fn launch(&self, app: &Path) -> Option<(PathBuf, Vec<String>)> {
         for recipe in &self.launch {
-            let mut files = matching_files(app, &recipe.file);
+            let mut files = matching_files(app, &recipe.file, false);
             if recipe.runnable_jar {
                 files.retain(|f| runnable_jar(f));
             }
