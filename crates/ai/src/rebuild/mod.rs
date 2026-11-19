@@ -389,13 +389,18 @@ impl RebuildRun {
             .map_err(|e| ToolError::internal(e.to_string()))?;
         let activity = feed.lock().unwrap_or_else(PoisonError::into_inner).activity();
         let run = RebuildRun { rx, stop, inbox, running, preview, notes, clean_room, feed, root, started: Instant::now(), activity };
-        // Waiting again with files of their own: the builder takes them at its next step or after
-        // its turn, and a run that ends first hands them to the next one, as with any note.
+        run.restore_left(left);
+        Ok(run)
+    }
+
+    /// Notes an earlier run left, waiting again with files of their own: the builder takes them at
+    /// its next step or after its turn, and a run that ends first hands them to the next one, as
+    /// with any note. Each keeps the time it was added, so one from before a stop doesn't undo it.
+    fn restore_left(&self, left: Vec<notes::Left>) {
         for n in left {
             let added = n.added.unwrap_or_else(std::time::SystemTime::now);
-            run.add_note_at(n.text, n.shown, n.pictures, added);
+            self.add_note_at(n.text, n.shown, n.pictures, added);
         }
-        Ok(run)
     }
 
     /// Add something while it works; the agent reads it at its next step, and only then does it

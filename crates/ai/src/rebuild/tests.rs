@@ -655,6 +655,92 @@ fn a_note_written_for_the_hook_carries_its_answers() {
     assert_eq!(questions::untold(&ws, false).len(), 1, "the next run decides whether to tell it");
 }
 
+/// A run as `RebuildRun::start` makes it, without a builder.
+fn bare_run(ws: &Workspace) -> RebuildRun {
+    let (_tx, rx) = std::sync::mpsc::channel();
+    let feed = Arc::new(Mutex::new(feed::FeedLog::open(ws)));
+    let activity = feed.lock().unwrap_or_else(PoisonError::into_inner).activity();
+    RebuildRun {
+        rx,
+        stop: CancelToken::default(),
+        inbox: Inbox::new(ws.inbox_dir()),
+        running: Arc::new(AtomicBool::new(true)),
+        preview: Arc::default(),
+        notes: Arc::default(),
+        clean_room: false,
+        feed,
+        root: ws.root.clone(),
+        started: Instant::now(),
+        activity,
+    }
+}
+
+/// The worker of `run`, reading the notes the run is given.
+fn notes_worker(ws: &Workspace, run: &RebuildRun) -> Worker {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    Worker {
+        wake: Default::default(),
+        engine: Arc::new(Engine::new(craft_anything_engine::testing::session())),
+        tx,
+        stop: CancelToken::default(),
+        preview: Arc::default(),
+        seen: HashSet::new(),
+        inbox: Inbox::new(ws.inbox_dir()),
+        editor: None,
+        notes: run.notes.clone(),
+        feed: run.feed.clone(),
+        keys: crate::KeyStore::file_only(ws.root.join("keys.toml")),
+        kept_checks: Mutex::default(),
+        assets: false,
+        usage: None,
+        self_check: None,
+        reset_progress_after_notes: false,
+    }
+}
+
+/// #948 (review on #1903): a note left waiting when the app closed, then a stop, then a run
+/// started without a new request. The run takes the note back as `start` does and the builder
+/// reads it: the note was asked before the stop, so Ghidra stays off. A note left after the stop,
+/// or one from a version that kept no time, is a new request and lets Ghidra run again.
+#[test]
+fn a_note_left_before_a_stop_keeps_it_across_a_restart() {
+    use craft_anything_engine::tools::deep;
+    // Run, then restart without a new request: what the builder sees once it reads the left notes.
+    fn restart(ws: &mut Workspace) -> bool {
+        let left = notes::take_left(&notes::notes_dir(&ws.inbox_dir()), true);
+        assert_eq!(left.len(), 1, "the note was left for the next run");
+        let run = bare_run(ws);
+        run.restore_left(left);
+        notes_worker(ws, &run).added(ws, true, true).expect("the left note is read");
+        assert!(run.waiting().is_empty(), "the builder took it");
+        deep::stopped(&ws.root)
+    }
+
+    // Left before the stop: the stop holds.
+    let d = tempfile::tempdir().unwrap();
+    let mut ws = Workspace::create(d.path(), "x", "Copy this game", TargetRef::None).unwrap();
+    bare_run(&ws).add_note("make it blue".into(), "make it blue".into(), Vec::new());
+    std::thread::sleep(Duration::from_millis(5));
+    deep::stop_for(&ws.root).unwrap();
+    assert!(restart(&mut ws), "a note from before the stop doesn't undo it after a restart");
+
+    // Left after the stop: a new request.
+    let d = tempfile::tempdir().unwrap();
+    let mut ws = Workspace::create(d.path(), "x", "Copy this game", TargetRef::None).unwrap();
+    deep::stop_for(&ws.root).unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+    bare_run(&ws).add_note("make it blue".into(), "make it blue".into(), Vec::new());
+    assert!(!restart(&mut ws), "a note added after the stop lets Ghidra run again");
+
+    // An older version's note keeps no time: it's taken as new, as before this change.
+    let d = tempfile::tempdir().unwrap();
+    let mut ws = Workspace::create(d.path(), "x", "Copy this game", TargetRef::None).unwrap();
+    deep::stop_for(&ws.root).unwrap();
+    let old = notes::Left { text: "make it blue".into(), shown: "make it blue".into(), pictures: Vec::new(), added: None };
+    notes::hand_over(&notes::notes_dir(&ws.inbox_dir()), 1, "make it blue", Some(&old)).unwrap();
+    assert!(!restart(&mut ws), "a note with no time is a new request");
+}
+
 #[test]
 fn pictures_of_the_original_reach_the_builder() {
     let d = tempfile::tempdir().unwrap();
