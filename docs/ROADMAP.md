@@ -761,6 +761,8 @@ yet, and the quick start is how every new person begins.
       — claimed: Plastic-time, branch bugfix/r5.7-result-lists-first-match-map
 - [x] Stop `result_lists` before indexing nested names when 64 root arrays fill the summary (#2116 follow-up).
       — claimed: Plastic-time, branch bugfix/r5.7-result-lists-cap-before-index
+- [x] Check that the nested lookup tables are built at 63 root arrays and skipped at 64 (#2125 follow-up).
+      — claimed: Plastic-time, branch test/r5.7-list-lookup-cap
 - [x] `app_builds_line_up` paired 1,448 of ~36,000 functions across two Rust toolchains: every
       v0 crate hash (`Cs<hash>_`) changed, so exact names rarely match, and some masked-bytes
       pairs are unrelated functions (`hex_encode` → `_git_oid_tostr`). Compare Rust names with
