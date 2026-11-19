@@ -787,6 +787,19 @@ launch or preview was run for this documentation correction.
   with its writing tools, shell and code execution switched off, and Maki refuses anything else
   that would ask (an MCP server's tools, in subagents too) unless the person allowed it in Maki's
   own permissions. It hasn't been run as a `maki -p` builder here.
+- Pi (`pi --mode json`, roadmap R2.2) is offered when `pi` is installed, detected by Detect, and
+  reads prompts from stdin. `pi --mode rpc --no-session --offline` (`get_available_models`, with
+  `--offline --list-models` fallback) populates the shared model/thinking picker using each
+  model's `thinkingLevelMap`, `--session <id>` resumes sessions, Clean room builds and analyses
+  are refused in `validate_access`, and questions/Deep analyses restrict tools (`--tools
+  read,grep,find,ls` for Deep, `--no-tools --no-extensions` for Clean room questions, with
+  `--no-session --no-mcp` and stripped tool overrides). It does not pass our MCP server per run
+  (setup uses `~/.pi/agent/mcp.json`) or forward mid-turn approvals. Unit tests cover args,
+  restricted overrides, `validate_access`, RPC/tabular model parsing, option conflicts, stream +
+  compaction parsing, deferred settlement errors and missing-session stderr; live checks with
+  `pi` 1.5.2 on Linux verified `ai test Pi`, `ai model Pi`, GUI detection and a `--mode json`
+  stdin run. A full live `rebuild`, tool-call streaming during a live build, and SSH runs were
+  not executed.
 - Claude Code is fully wired as a builder; Codex works through its own flags (our tools are pre-approved for
   `codex exec` and every tool permitted by the current mode is listed from startup, see `docs/codex.md`)
   and resumes its reported thread on follow-up turns and when reopening a saved session.

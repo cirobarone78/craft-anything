@@ -14,6 +14,7 @@ mod grok;
 mod hermes;
 mod maki;
 mod opencode;
+mod pi;
 pub use aider::Aider;
 pub use antigravity::Antigravity;
 pub use copilot::Copilot;
@@ -23,6 +24,7 @@ pub use grok::Grok;
 pub use hermes::Hermes;
 pub use maki::Maki;
 pub use opencode::OpenCode;
+pub use pi::Pi;
 
 /// What a run's arguments are built from.
 pub struct ArgsCx<'a> {
@@ -181,6 +183,10 @@ pub trait AgentAdapter: Send + Sync {
     fn parse(&self, _p: &mut StreamParser, _v: &Value) -> Vec<AgentEvent> {
         Vec::new()
     }
+    /// Events flushed when a zero-exit process ends before a terminal settlement line.
+    fn finish(&self, _p: &mut StreamParser) -> Vec<AgentEvent> {
+        Vec::new()
+    }
     /// Diagnostics that an agent reports outside its JSON stream.
     fn parse_stderr(&self, _p: &mut StreamParser, _line: &str) -> Vec<AgentEvent> {
         Vec::new()
@@ -327,6 +333,7 @@ impl AgentAdapters {
                 Arc::new(Grok),
                 Arc::new(DeepSeekHarness),
                 Arc::new(Devin),
+                Arc::new(Pi),
             ],
         }
     }
