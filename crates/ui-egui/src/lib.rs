@@ -595,7 +595,7 @@ pub struct CraftApp {
     chat_jobs: Vec<u64>,
     view_dirty: bool,
     last_view: Option<Instant>,
-    applied_theme: Option<(ThemeKind, bool)>,
+    applied_theme: Option<ThemeKind>,
     /// The system's light or dark appearance, read each frame: the System theme follows it.
     system_theme: Option<egui::Theme>,
     started: bool,
@@ -1934,9 +1934,9 @@ impl CraftApp {
         }
         // eframe reports the system's appearance in each frame's input, and again when it changes.
         self.system_theme = ctx.system_theme();
-        let want = (self.theme_kind(), self.beginner());
+        let want = self.theme_kind();
         if self.applied_theme != Some(want) {
-            theme::apply(ctx, want.0, want.1);
+            theme::apply(ctx, want);
             self.applied_theme = Some(want);
         }
         self.take_finished_jobs();
